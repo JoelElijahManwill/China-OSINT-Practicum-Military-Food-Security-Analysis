@@ -1,0 +1,180 @@
+// Define Heilongjiang Province boundaries (approximate coordinates)
+var HEILONGJIANG_BOUNDS = ee.Geometry.Polygon([
+  [[125.0, 53.5],  // Northeast corner
+   [135.0, 53.5],  // Northwest corner
+   [135.0, 43.4],  // Southwest corner
+   [125.0, 43.4]]  // Southeast corner
+]);
+
+// Define a smaller agricultural region in central Heilongjiang (approximate coordinates)
+// This region is in the Songnen Plain, one of China's major agricultural areas
+var AGRICULTURAL_REGION = ee.Geometry.Polygon([
+  [[126.5, 47.2],  // Northeast corner
+   [127.5, 47.2],  // Northwest corner
+   [127.5, 46.8],  // Southwest corner
+   [126.5, 46.8]]  // Southeast corner
+]);
+
+// Function to calculate NDVI with error handling
+function addNDVI(image) {
+  var ndvi = image.normalizedDifference(['SR_B5', 'SR_B4'])
+    .rename('NDVI')
+    .set('system:time_start', image.get('system:time_start'));
+  return image.addBands(ndvi);
+}
+
+// Enhanced cloud masking function
+function maskClouds(image) {
+  var qa = image.select('QA_PIXEL');
+  var cloudMask = qa.bitwiseAnd(1 << 3).eq(0);
+  var snowMask = qa.bitwiseAnd(1 << 4).eq(0);
+  return image.updateMask(cloudMask.and(snowMask));
+}
+
+// Get Landsat 8 collection with quality filters
+var collection = ee.ImageCollection('LANDSAT/LC08/C02/T1_L2')
+  .filterBounds(AGRICULTURAL_REGION)  // Changed to use smaller region
+  .filterDate('2020-08-16', '2022-08-18')  // Extended time period
+  .filter(ee.Filter.lt('CLOUD_COVER', 20))  // Filter out cloudy images
+  .map(maskClouds)
+  .map(addNDVI);
+
+// Calculate monthly NDVI statistics with confidence intervals using reduceRegions
+var monthlyStats = ee.List.sequence(1, 12).map(function(month) {
+  var monthCollection = collection.filter(ee.Filter.calendarRange(month, month, 'month'));
+  var meanNDVI = monthCollection.select('NDVI').mean();
+  var stdNDVI = monthCollection.select('NDVI').reduce(ee.Reducer.stdDev());
+  var count = monthCollection.size();
+  
+  var stats = meanNDVI.reduceRegions({
+    collection: ee.FeatureCollection([ee.Feature(AGRICULTURAL_REGION)]),
+    reducer: ee.Reducer.mean(),
+    scale: 30,  // Can use finer scale for smaller area
+    tileScale: 16,
+    maxPixelsPerRegion: 1e9
+  });
+  
+  return ee.Feature(null, {
+    'month': month,
+    'mean_ndvi': stats.first().get('NDVI'),
+    'std_ndvi': stdNDVI,
+    'sample_count': count,
+    'confidence_interval': stdNDVI.divide(ee.Number(count).sqrt())
+  });
+});
+
+// Create enhanced time series chart with optimized parameters
+var chart = ui.Chart.image.series({
+  imageCollection: collection.select('NDVI'),
+  region: AGRICULTURAL_REGION,  // Changed to use smaller region
+  reducer: ee.Reducer.mean(),
+  scale: 30,  // Can use finer scale for smaller area
+  xProperty: 'system:time_start'
+})
+.setOptions({
+  title: 'NDVI Time Series for Agricultural Region in Heilongjiang Province (2017-2024)',
+  vAxis: {title: 'NDVI', minValue: 0, maxValue: 1},
+  hAxis: {title: 'Date'},
+  lineWidth: 2,
+  pointSize: 4,
+  series: {
+    0: {color: '#1d6b99', lineWidth: 2}
+  },
+  legend: {position: 'top'},
+  animation: {duration: 1000}
+});
+
+// Calculate growing season statistics with additional metrics
+var growingSeason = collection.filter(ee.Filter.calendarRange(5, 9, 'month'));
+var growingSeasonStats = ee.Dictionary({
+  'mean_ndvi': growingSeason.select('NDVI').mean(),
+  'max_ndvi': growingSeason.select('NDVI').max(),
+  'min_ndvi': growingSeason.select('NDVI').min(),
+  'std_ndvi': growingSeason.select('NDVI').reduce(ee.Reducer.stdDev()),
+  'sample_count': growingSeason.size()
+});
+
+// Create monthly NDVI visualization with improved color scheme
+var monthlyNDVI = ee.ImageCollection.fromImages(
+  ee.List.sequence(1, 12).map(function(month) {
+    return collection
+      .filter(ee.Filter.calendarRange(month, month, 'month'))
+      .select('NDVI')
+      .mean()
+      .set('month', month);
+  })
+);
+
+// Enhanced visualization parameters
+var ndviVis = {
+  min: 0,
+  max: 1,
+  palette: [
+    'FFFFFF', 'CE7E45', 'DF923D', 'F1B555', 'FCD163', '99B718',
+    '74A901', '66A000', '529400', '3E8601', '207401', '056201',
+    '004C00', '023B01', '012E01', '011D01', '011301'
+  ],
+  opacity: 0.8
+};
+
+// Add layers to the map with improved visualization
+Map.centerObject(AGRICULTURAL_REGION, 10);  // Increased zoom level for smaller area
+
+// Add the full province boundary for reference
+Map.addLayer(HEILONGJIANG_BOUNDS, {color: 'gray'}, 'Heilongjiang Province Boundary', false);
+
+// Add the agricultural region boundary
+Map.addLayer(AGRICULTURAL_REGION, {color: 'red'}, 'Agricultural Region', true);
+
+// Add monthly NDVI layers with improved layer naming
+for (var i = 1; i <= 12; i++) {
+  var monthImage = monthlyNDVI.filter(ee.Filter.eq('month', i)).first();
+  var monthName = ee.Date.fromYMD(2023, i, 1).format('MMMM').getInfo();
+  Map.addLayer(monthImage, ndviVis, 'NDVI - ' + monthName, false);
+}
+
+// Add the chart to the map
+Map.add(chart);
+
+// Print statistics with formatting
+print('Monthly NDVI Statistics:', monthlyStats);
+print('Growing Season Statistics:', growingSeasonStats);
+
+
+
+
+// Export functions (commented out, uncomment to run)
+
+// Export monthly statistics
+Export.table.toDrive({
+  collection: monthlyStats,
+  description: 'heilongjiang_agricultural_region_monthly_ndvi_stats_2017_2024'
+});
+
+// Export growing season mean NDVI
+Export.image.toDrive({
+  image: growingSeason.select('NDVI').mean(),
+  description: 'heilongjiang_agricultural_region_growing_season_ndvi_2017_2024',
+  scale: 30,  // Can use finer scale for smaller area
+  region: AGRICULTURAL_REGION,
+  maxPixels: 1e9,
+  //tileScale: 16,
+  //bestEffort: true
+});
+
+// Export time series data
+Export.table.toDrive({
+  collection: collection.select('NDVI').map(function(image) {
+    return ee.Feature(null, {
+      'date': ee.Date(image.get('system:time_start')).format('YYYY-MM-dd'),
+      'ndvi': image.select('NDVI').reduceRegions({
+        collection: ee.FeatureCollection([ee.Feature(AGRICULTURAL_REGION)]),
+        reducer: ee.Reducer.mean(),
+        scale: 30,  // Can use finer scale for smaller area
+        tileScale: 16,
+        maxPixelsPerRegion: 1e9
+      }).first().get('NDVI')
+    });
+  }),
+  description: 'heilongjiang_agricultural_region_ndvi_time_series_2017_2024'
+});
